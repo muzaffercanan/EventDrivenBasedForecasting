@@ -1,0 +1,56 @@
+# Python ortamları - ASLA GİT'E EKLEME
+_env/
+u_mamba_env/
+pitonFinal310/
+.venv/
+venv/
+env/
+*.egg-info/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# IDE ve editör ayarları
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb
+
+# Veri dosyaları - Büyük dosyalar (ayrı indirilecek)
+ETF/
+SP500_news/
+Gold_sentiment/
+Commodities/
+nnUNet_raw/
+/data/
+*.csv
+*.xlsx
+*.xls
+*.parquet
+*.npy
+*.npz
+
+# Model eğitim logları ve sonuçlar
+wandb/
+Results/
+logs/
+*.h5
+*.pb
+*.pth
+*.ckpt
+saved_models/
+
+# Geçici dosyalar
+Yeni klasör/
+.qodo
+
+U-Mamba/
+causal-conv1d/
