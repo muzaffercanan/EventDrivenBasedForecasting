@@ -34,6 +34,75 @@ def _ensure_dirs():
     os.makedirs("SP500_news/results", exist_ok=True)
 
 
+def filter_irrelevant_news(df: pd.DataFrame, title_col: str = "Title") -> pd.DataFrame:
+    """
+    Filter out irrelevant news headlines that are not related to SP500/financial markets.
+    
+    Returns filtered dataframe with 'is_relevant' column added.
+    """
+    # Irrelevant keywords/phrases (case-insensitive)
+    irrelevant_patterns = [
+        # Personal/community events
+        r'\bmarriage\b', r'\bcommunity\b', r'\bdrowning\b', r'\bwedding\b',
+        # Sports/entertainment
+        r'\bsuper bowl\b', r'\bfootball\b', r'\bbasketball\b', r'\bsoccer\b',
+        # Technology products (non-financial)
+        r'\bsatin ps3\b', r'\bplaystation\b', r'\bxbox\b',
+        # Random items
+        r'\bhedgehog\b', r'\bpiezo driver\b',
+        # Non-financial tech
+        r'\bhandset holder\b', r'\bethernet communication cards\b',
+    ]
+    
+    # Financial/SP500 relevant keywords (if these are present, keep the news)
+    relevant_keywords = [
+        r'\bsp500\b', r'\bs&p\b', r'\bs&p 500\b', r'\bsp\s*500\b',
+        r'\bstock\b', r'\bstocks\b', r'\bmarket\b', r'\bmarkets\b',
+        r'\bfinancial\b', r'\bfinance\b', r'\beconomy\b', r'\beconomic\b',
+        r'\binvest\b', r'\binvestment\b', r'\btrading\b', r'\btrade\b',
+        r'\bdow\b', r'\bnasdaq\b', r'\bindex\b', r'\bindices\b',
+        r'\bcompany\b', r'\bcompanies\b', r'\bcorporate\b', r'\bcorporation\b',
+        r'\bearnings\b', r'\brevenue\b', r'\bprofit\b', r'\bloss\b',
+        r'\bfed\b', r'\bfederal reserve\b', r'\binflation\b', r'\binterest rate\b',
+        r'\bsec\b', r'\bsecurities\b', r'\bexchange\b',
+    ]
+    
+    df = df.copy()
+    df['title_lower'] = df[title_col].astype(str).str.lower()
+    
+    # Check for irrelevant patterns
+    has_irrelevant = df['title_lower'].str.contains('|'.join(irrelevant_patterns), 
+                                                     case=False, na=False, regex=True)
+    
+    # Check for relevant keywords
+    has_relevant = df['title_lower'].str.contains('|'.join(relevant_keywords), 
+                                                   case=False, na=False, regex=True)
+    
+    # Mark as relevant if:
+    # 1. Has relevant keywords AND no irrelevant patterns, OR
+    # 2. No irrelevant patterns and title length > 20 (likely financial news)
+    df['is_relevant'] = (
+        (has_relevant & ~has_irrelevant) | 
+        (~has_irrelevant & (df[title_col].str.len() > 20))
+    )
+    
+    # Additional filters
+    # Remove very short titles (likely not real news)
+    df.loc[df[title_col].str.len() < 10, 'is_relevant'] = False
+    
+    # Remove titles that are just dates or numbers
+    df.loc[df[title_col].str.match(r'^\d{4}[\s-]?\d{1,2}[\s-]?\d{1,2}$'), 'is_relevant'] = False
+    
+    # Drop the helper column
+    df = df.drop(columns=['title_lower'])
+    
+    filtered_count = (~df['is_relevant']).sum()
+    if filtered_count > 0:
+        print(f"Filtered out {filtered_count} irrelevant headlines ({filtered_count/len(df)*100:.2f}%)")
+    
+    return df
+
+
 # Default model configurations
 DEFAULT_MODELS = {
     "finbert": {
@@ -235,7 +304,9 @@ def run_ensemble_pipeline(
     device: Optional[int] = None,
     batch_size: int = 32,
     max_length: int = 128,
-    save_parquet: bool = False
+    save_parquet: bool = False,
+    time_decay: float = 0.1,
+    volatility_window: int = 20
 ):
     """Run ensemble sentiment analysis pipeline"""
     _ensure_dirs()
@@ -255,6 +326,11 @@ def run_ensemble_pipeline(
     # Clean basic
     df[title_col] = df[title_col].astype(str).fillna("").str.strip()
     df = df[df[title_col] != ""].copy()
+    
+    # Filter irrelevant news
+    df = filter_irrelevant_news(df, title_col=title_col)
+    df = df[df['is_relevant']].copy()
+    df = df.drop(columns=['is_relevant'])
     
     # Parse date
     df["__date"] = pd.to_datetime(df[date_col], errors="coerce")
@@ -349,7 +425,7 @@ def run_ensemble_pipeline(
         except Exception as e:
             print(f"Parquet save failed: {e}")
     
-    # 6) Daily aggregation
+    # 6) Daily aggregation with time weighting and volatility normalization
     def coarse_label(x: str) -> str:
         x = (x or "").upper()
         if "NEG" in x:
@@ -360,24 +436,75 @@ def run_ensemble_pipeline(
     
     df["ensemble_label_coarse"] = df["ensemble_label"].apply(coarse_label)
     
+    # Sort by date for time weighting
+    df = df.sort_values("__date").reset_index(drop=True)
+    
     grp = df.groupby(df["__date"].dt.date)
     
+    # Calculate time-weighted aggregation
+    daily_dates = []
+    daily_news_count = []
+    daily_pos_count = []
+    daily_neg_count = []
+    daily_neu_count = []
+    daily_signed_mean = []
+    daily_signed_std = []
+    daily_signed_min = []
+    daily_signed_max = []
+    
+    for date, group in grp:
+        daily_dates.append(date)
+        daily_news_count.append(len(group))
+        daily_pos_count.append((group["ensemble_label_coarse"] == "POSITIVE").sum())
+        daily_neg_count.append((group["ensemble_label_coarse"] == "NEGATIVE").sum())
+        daily_neu_count.append((group["ensemble_label_coarse"] == "NEUTRAL").sum())
+        
+        # Time-weighted mean (more recent headlines have higher weight)
+        signed_scores = group["ensemble_signed"].values
+        if len(signed_scores) > 0:
+            # Exponential decay: newer items have higher weight
+            weights = np.exp(-time_decay * np.arange(len(signed_scores))[::-1])
+            weights = weights / weights.sum()
+            weighted_mean = np.average(signed_scores, weights=weights)
+            daily_signed_mean.append(weighted_mean)
+        else:
+            daily_signed_mean.append(0.0)
+        
+        daily_signed_std.append(group["ensemble_signed"].std(ddof=0) if len(group) > 1 else 0.0)
+        daily_signed_min.append(group["ensemble_signed"].min())
+        daily_signed_max.append(group["ensemble_signed"].max())
+    
     daily = pd.DataFrame({
-        "date": list(grp.groups.keys()),
-        "news_count": grp.size().values,
-        "pos_count": grp.apply(lambda g: (g["ensemble_label_coarse"] == "POSITIVE").sum()).values,
-        "neg_count": grp.apply(lambda g: (g["ensemble_label_coarse"] == "NEGATIVE").sum()).values,
-        "neu_count": grp.apply(lambda g: (g["ensemble_label_coarse"] == "NEUTRAL").sum()).values,
-        "signed_mean": grp["ensemble_signed"].mean().values,
-        "signed_std": grp["ensemble_signed"].std(ddof=0).values,
-        "signed_min": grp["ensemble_signed"].min().values,
-        "signed_max": grp["ensemble_signed"].max().values,
+        "date": daily_dates,
+        "news_count": daily_news_count,
+        "pos_count": daily_pos_count,
+        "neg_count": daily_neg_count,
+        "neu_count": daily_neu_count,
+        "signed_mean": daily_signed_mean,
+        "signed_std": daily_signed_std,
+        "signed_min": daily_signed_min,
+        "signed_max": daily_signed_max,
     })
     
-    # Add individual model aggregations
+    # Volatility normalization: normalize signed_mean by rolling volatility
+    daily = daily.sort_values("date").reset_index(drop=True)
+    rolling_std = daily["signed_mean"].rolling(window=volatility_window, min_periods=1).std()
+    rolling_std = rolling_std.replace(0, 1)  # Avoid division by zero
+    daily["signed_mean_normalized"] = daily["signed_mean"] / rolling_std
+    
+    # Add individual model aggregations with time weighting
     for model_name in pipelines.keys():
         if f"{model_name}_signed" in df.columns:
-            daily[f"{model_name}_signed_mean"] = grp[f"{model_name}_signed"].mean().values
+            model_means = []
+            for date, group in grp:
+                model_scores = group[f"{model_name}_signed"].values
+                if len(model_scores) > 0:
+                    weights = np.exp(-time_decay * np.arange(len(model_scores))[::-1])
+                    weights = weights / weights.sum()
+                    model_means.append(np.average(model_scores, weights=weights))
+                else:
+                    model_means.append(0.0)
+            daily[f"{model_name}_signed_mean"] = model_means
     
     daily = daily.sort_values("date").reset_index(drop=True)
     
@@ -440,6 +567,10 @@ def main():
     p.add_argument("--save_parquet", action="store_true")
     p.add_argument("--models", type=str, nargs="+", default=None,
                    help="List of model names to use (default: all)")
+    p.add_argument("--time_decay", type=float, default=0.1,
+                   help="Exponential decay factor for time weighting (default: 0.1)")
+    p.add_argument("--volatility_window", type=int, default=20,
+                   help="Window size for volatility normalization (default: 20)")
     
     args = p.parse_args()
     
@@ -461,6 +592,8 @@ def main():
         batch_size=args.batch_size,
         max_length=args.max_length,
         save_parquet=args.save_parquet,
+        time_decay=args.time_decay,
+        volatility_window=args.volatility_window,
     )
 
 

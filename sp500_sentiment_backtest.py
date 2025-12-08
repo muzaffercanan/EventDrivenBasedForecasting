@@ -68,6 +68,124 @@ def merge_signal_returns(df_sig: pd.DataFrame, df_ret: pd.DataFrame, date_col_si
     return df
 
 
+def compute_trend_filter(df: pd.DataFrame, price_col: str = "CP", 
+                         short_window: int = 50, long_window: int = 200) -> pd.Series:
+    """Compute trend filter using moving averages"""
+    if price_col not in df.columns:
+        # Reconstruct price from returns if needed
+        df["_cumret"] = (1.0 + df["ret"].fillna(0.0)).cumprod()
+        prices = df["_cumret"] * 100
+    else:
+        prices = df[price_col]
+    
+    ma_short = prices.rolling(window=short_window, min_periods=1).mean()
+    ma_long = prices.rolling(window=long_window, min_periods=1).mean()
+    
+    # 1 = uptrend, -1 = downtrend, 0 = neutral
+    trend = np.where(ma_short > ma_long, 1, np.where(ma_short < ma_long, -1, 0))
+    return pd.Series(trend, index=df.index, name="trend")
+
+
+def compute_volatility_filter(df: pd.DataFrame, ret_col: str = "ret",
+                              window: int = 20, threshold_percentile: float = 75.0) -> pd.Series:
+    """Compute volatility filter: 1 = low volatility (trade), 0 = high volatility (no trade)"""
+    rolling_vol = df[ret_col].rolling(window=window, min_periods=1).std()
+    threshold = rolling_vol.quantile(threshold_percentile / 100.0)
+    return pd.Series((rolling_vol <= threshold).astype(int), index=df.index, name="vol_filter")
+
+
+def compute_position_size(df: pd.DataFrame, ret_col: str = "ret",
+                         base_size: float = 1.0, volatility_window: int = 20,
+                         min_size: float = 0.1, max_size: float = 1.0) -> pd.Series:
+    """Compute position size based on volatility (volatility targeting)"""
+    rolling_vol = df[ret_col].rolling(window=volatility_window, min_periods=1).std()
+    target_vol = rolling_vol.median()  # Target median volatility
+    
+    # Position size inversely proportional to volatility
+    position_size = base_size * (target_vol / (rolling_vol + 1e-8))
+    position_size = position_size.clip(lower=min_size, upper=max_size)
+    
+    return pd.Series(position_size, index=df.index, name="position_size")
+
+
+def build_positions_enhanced(df: pd.DataFrame, tpos: float, tneg: float, nmin: int,
+                            use_trend_filter: bool = True,
+                            use_volatility_filter: bool = True,
+                            use_signal_quality: bool = True,
+                            signal_quality_threshold: float = 0.15,
+                            trend_col: str = "trend",
+                            vol_filter_col: str = "vol_filter",
+                            signed_mean_col: str = "signed_mean",
+                            signed_std_col: str = "signed_std") -> pd.Series:
+    """Enhanced position building with multiple filters"""
+    sig = df[signed_mean_col].fillna(0.0)
+    cnt = df["news_count"].fillna(0).astype(int)
+    
+    # Base signal
+    base_long = (sig >= tpos) & (cnt >= nmin)
+    base_short = (sig <= -tneg) & (cnt >= nmin)
+    
+    # Signal quality filter: require stronger signals or consistent sentiment
+    if use_signal_quality:
+        if signed_std_col in df.columns:
+            sig_std = df[signed_std_col].fillna(1.0)
+            # Strong signal: high absolute value OR low std (consistent sentiment)
+            quality_filter = (np.abs(sig) >= signal_quality_threshold) | (sig_std < 0.3)
+            base_long = base_long & quality_filter
+            base_short = base_short & quality_filter
+    
+    # Trend filter
+    if use_trend_filter and trend_col in df.columns:
+        trend = df[trend_col].fillna(0)
+        base_long = base_long & (trend >= 0)  # Only long in uptrend or neutral
+        base_short = base_short & (trend <= 0)  # Only short in downtrend or neutral
+    
+    # Volatility filter
+    if use_volatility_filter and vol_filter_col in df.columns:
+        vol_filter = df[vol_filter_col].fillna(0)
+        base_long = base_long & (vol_filter == 1)
+        base_short = base_short & (vol_filter == 1)
+    
+    pos = np.where(base_long, 1,
+          np.where(base_short, -1, 0))
+    
+    return pd.Series(pos, index=df.index, name="position")
+
+
+def apply_holding_period_limit(df: pd.DataFrame, position_col: str = "position",
+                              max_holding_days: int = 20) -> pd.Series:
+    """Limit maximum holding period for positions"""
+    position = df[position_col].copy()
+    position_with_limit = position.copy()
+    
+    current_position = 0
+    entry_day = None
+    
+    for i in range(len(df)):
+        if position.iloc[i] != 0:
+            if current_position == 0:
+                # New position
+                current_position = position.iloc[i]
+                entry_day = i
+            elif position.iloc[i] != current_position:
+                # Position changed
+                current_position = position.iloc[i]
+                entry_day = i
+            else:
+                # Same position continues
+                if entry_day is not None and (i - entry_day) >= max_holding_days:
+                    # Force close after max holding period
+                    position_with_limit.iloc[i] = 0
+                    current_position = 0
+                    entry_day = None
+        else:
+            # No position
+            current_position = 0
+            entry_day = None
+    
+    return pd.Series(position_with_limit, index=df.index, name="position_with_limit")
+
+
 def build_positions(df: pd.DataFrame, tpos: float, tneg: float, nmin: int) -> pd.Series:
     sig = df["signed_mean"].fillna(0.0)
     cnt = df["news_count"].fillna(0).astype(int)
@@ -273,7 +391,18 @@ def run_backtest(agg_csv: str,
                  stop_loss: float = None,
                  take_profit: float = None,
                  trailing_stop: float = None,
-                 max_drawdown_limit: float = None) -> Tuple[pd.DataFrame, dict]:
+                 max_drawdown_limit: float = None,
+                 use_trend_filter: bool = True,
+                 use_volatility_filter: bool = True,
+                 use_position_sizing: bool = True,
+                 use_signal_quality: bool = True,
+                 signal_quality_threshold: float = 0.15,
+                 max_holding_days: int = 20,
+                 trend_short_window: int = 50,
+                 trend_long_window: int = 200,
+                 volatility_window: int = 20,
+                 volatility_percentile: float = 75.0,
+                 base_position_size: float = 1.0) -> Tuple[pd.DataFrame, dict]:
     _ensure_dirs()
 
     # Load data
@@ -296,21 +425,53 @@ def run_backtest(agg_csv: str,
         df = df[df[date_col] >= pd.to_datetime(start_date)]
     if end_date:
         df = df[df[date_col] <= pd.to_datetime(end_date)]
+    
+    # Ensure price column exists for trend calculation
+    if price_col not in df.columns:
+        df["_cumret"] = (1.0 + df["ret"].fillna(0.0)).cumprod()
+        df[price_col] = df["_cumret"] * 100
 
-    # Build positions and shift
-    df["position_raw"] = build_positions(df, tpos=tpos, tneg=tneg, nmin=nmin)
+    # Compute filters
+    if use_trend_filter:
+        df["trend"] = compute_trend_filter(df, price_col=price_col,
+                                           short_window=trend_short_window,
+                                           long_window=trend_long_window)
+    
+    if use_volatility_filter:
+        df["vol_filter"] = compute_volatility_filter(df, ret_col="ret",
+                                                    window=volatility_window,
+                                                    threshold_percentile=volatility_percentile)
+    
+    # Build positions with enhanced filters
+    df["position_raw"] = build_positions_enhanced(
+        df, tpos=tpos, tneg=tneg, nmin=nmin,
+        use_trend_filter=use_trend_filter,
+        use_volatility_filter=use_volatility_filter,
+        use_signal_quality=use_signal_quality,
+        signal_quality_threshold=signal_quality_threshold
+    )
+    
+    # Apply holding period limit
+    if max_holding_days > 0:
+        df["position_raw"] = apply_holding_period_limit(df, position_col="position_raw",
+                                                        max_holding_days=max_holding_days)
+    
     df["position"] = shift_positions(df, pos_col="position_raw")
+    
+    # Apply position sizing
+    if use_position_sizing:
+        df["position_size"] = compute_position_size(df, ret_col="ret",
+                                                   base_size=base_position_size,
+                                                   volatility_window=volatility_window)
+        df["position"] = df["position"] * df["position_size"]
     
     # Apply risk management if specified
     if any([stop_loss, take_profit, trailing_stop, max_drawdown_limit]):
         # Need price column for risk management
         if price_col not in df.columns:
-            # Reconstruct price from returns if not available
-            df[price_col] = df[price_col] if price_col in df.columns else None
-            if price_col not in df.columns or df[price_col].isna().all():
-                # Use cumulative returns to approximate price
+            if "_cumret" not in df.columns:
                 df["_cumret"] = (1.0 + df["ret"].fillna(0.0)).cumprod()
-                df[price_col] = df["_cumret"] * 100  # Normalize to price-like scale
+            df[price_col] = df["_cumret"] * 100
         
         df = apply_risk_management(
             df,
@@ -345,6 +506,12 @@ def run_backtest(agg_csv: str,
         output_cols.append("risk_action")
     if "unrealized_pnl" in df_bt.columns:
         output_cols.append("unrealized_pnl")
+    if "trend" in df_bt.columns:
+        output_cols.append("trend")
+    if "vol_filter" in df_bt.columns:
+        output_cols.append("vol_filter")
+    if "position_size" in df_bt.columns:
+        output_cols.append("position_size")
     df_bt[output_cols].to_csv(out_eq, index=False)
 
     out_metrics = "SP500_news/results/backtest_metrics.json"
@@ -358,6 +525,15 @@ def run_backtest(agg_csv: str,
         f.write("=================================\n\n")
         f.write(f"Rule: long if signed_mean >= {tpos} and news_count >= {nmin}; short if signed_mean <= -{tneg} and news_count >= {nmin}; else flat.\n")
         f.write(f"Return type: {ret_type}\n\n")
+        
+        # Enhanced filters info
+        f.write("Enhanced Filters:\n")
+        f.write(f"  Trend filter: {'ON' if use_trend_filter else 'OFF'} (MA{trend_short_window}/MA{trend_long_window})\n")
+        f.write(f"  Volatility filter: {'ON' if use_volatility_filter else 'OFF'} (window={volatility_window}, percentile={volatility_percentile})\n")
+        f.write(f"  Position sizing: {'ON' if use_position_sizing else 'OFF'} (base_size={base_position_size})\n")
+        f.write(f"  Signal quality filter: {'ON' if use_signal_quality else 'OFF'} (threshold={signal_quality_threshold})\n")
+        f.write(f"  Max holding period: {max_holding_days} days\n")
+        f.write("\n")
         
         # Risk management info
         if any([stop_loss, take_profit, trailing_stop, max_drawdown_limit]):
@@ -408,7 +584,18 @@ def run_walk_forward_analysis(agg_csv: str,
                               stop_loss: float = None,
                               take_profit: float = None,
                               trailing_stop: float = None,
-                              max_drawdown_limit: float = None) -> Tuple[pd.DataFrame, Dict]:
+                              max_drawdown_limit: float = None,
+                              use_trend_filter: bool = True,
+                              use_volatility_filter: bool = True,
+                              use_position_sizing: bool = True,
+                              use_signal_quality: bool = True,
+                              signal_quality_threshold: float = 0.15,
+                              max_holding_days: int = 20,
+                              trend_short_window: int = 50,
+                              trend_long_window: int = 200,
+                              volatility_window: int = 20,
+                              volatility_percentile: float = 75.0,
+                              base_position_size: float = 1.0) -> Tuple[pd.DataFrame, Dict]:
     """
     Walk-forward analysis: Rolling window backtest
     
@@ -499,14 +686,50 @@ def run_walk_forward_analysis(agg_csv: str,
         # Reset index for risk management function
         df_test = df_test.reset_index(drop=True)
         
-        # Build positions
-        df_test["position_raw"] = build_positions(df_test, tpos=tpos, tneg=tneg, nmin=nmin)
+        # Ensure price column exists
+        if price_col not in df_test.columns:
+            df_test["_cumret"] = (1.0 + df_test["ret"].fillna(0.0)).cumprod()
+            df_test[price_col] = df_test["_cumret"] * 100
+        
+        # Compute filters
+        if use_trend_filter:
+            df_test["trend"] = compute_trend_filter(df_test, price_col=price_col,
+                                                   short_window=trend_short_window,
+                                                   long_window=trend_long_window)
+        
+        if use_volatility_filter:
+            df_test["vol_filter"] = compute_volatility_filter(df_test, ret_col="ret",
+                                                            window=volatility_window,
+                                                            threshold_percentile=volatility_percentile)
+        
+        # Build positions with enhanced filters
+        df_test["position_raw"] = build_positions_enhanced(
+            df_test, tpos=tpos, tneg=tneg, nmin=nmin,
+            use_trend_filter=use_trend_filter,
+            use_volatility_filter=use_volatility_filter,
+            use_signal_quality=use_signal_quality,
+            signal_quality_threshold=signal_quality_threshold
+        )
+        
+        # Apply holding period limit
+        if max_holding_days > 0:
+            df_test["position_raw"] = apply_holding_period_limit(df_test, position_col="position_raw",
+                                                                max_holding_days=max_holding_days)
+        
         df_test["position"] = shift_positions(df_test, pos_col="position_raw")
+        
+        # Apply position sizing
+        if use_position_sizing:
+            df_test["position_size"] = compute_position_size(df_test, ret_col="ret",
+                                                           base_size=base_position_size,
+                                                           volatility_window=volatility_window)
+            df_test["position"] = df_test["position"] * df_test["position_size"]
         
         # Apply risk management if specified
         if any([stop_loss, take_profit, trailing_stop, max_drawdown_limit]):
             if price_col not in df_test.columns:
-                df_test["_cumret"] = (1.0 + df_test["ret"].fillna(0.0)).cumprod()
+                if "_cumret" not in df_test.columns:
+                    df_test["_cumret"] = (1.0 + df_test["ret"].fillna(0.0)).cumprod()
                 df_test[price_col] = df_test["_cumret"] * 100
             
             df_test = apply_risk_management(
@@ -675,9 +898,9 @@ def main():
     p.add_argument("--price_csv", type=str, default="SP500_news/raw/sp500_headlines_2008_2024.csv")
     p.add_argument("--date_col", type=str, default="Date")
     p.add_argument("--price_col", type=str, default="CP")
-    p.add_argument("--tpos", type=float, default=0.10)
-    p.add_argument("--tneg", type=float, default=0.10)
-    p.add_argument("--nmin", type=int, default=5)
+    p.add_argument("--tpos", type=float, default=0.10, help="Positive threshold (default: 0.10)")
+    p.add_argument("--tneg", type=float, default=0.10, help="Negative threshold (default: 0.10)")
+    p.add_argument("--nmin", type=int, default=5, help="Minimum news count (default: 5)")
     p.add_argument("--ret", type=str, default="log", choices=["log", "simple"], help="Return type: log or simple")
     
     # Risk management arguments
@@ -691,8 +914,27 @@ def main():
     p.add_argument("--train_years", type=int, default=2, help="Training period in years (for walk-forward)")
     p.add_argument("--test_years", type=int, default=1, help="Test period in years (for walk-forward)")
     p.add_argument("--step_months", type=int, default=6, help="Step size in months (for walk-forward)")
+    
+    # Enhanced filter arguments
+    p.add_argument("--no_trend_filter", action="store_true", help="Disable trend filter")
+    p.add_argument("--no_volatility_filter", action="store_true", help="Disable volatility filter")
+    p.add_argument("--no_position_sizing", action="store_true", help="Disable position sizing")
+    p.add_argument("--no_signal_quality", action="store_true", help="Disable signal quality filter")
+    p.add_argument("--signal_quality_threshold", type=float, default=0.15, help="Signal quality threshold (default: 0.15)")
+    p.add_argument("--max_holding_days", type=int, default=20, help="Maximum holding period in days (default: 20)")
+    p.add_argument("--trend_short_window", type=int, default=50, help="Short MA window for trend filter (default: 50)")
+    p.add_argument("--trend_long_window", type=int, default=200, help="Long MA window for trend filter (default: 200)")
+    p.add_argument("--volatility_window", type=int, default=20, help="Window for volatility filter (default: 20)")
+    p.add_argument("--volatility_percentile", type=float, default=75.0, help="Volatility percentile threshold (default: 75.0)")
+    p.add_argument("--base_position_size", type=float, default=1.0, help="Base position size (default: 1.0)")
 
     args = p.parse_args()
+    
+    # Prepare enhanced filter flags
+    use_trend_filter = not args.no_trend_filter
+    use_volatility_filter = not args.no_volatility_filter
+    use_position_sizing = not args.no_position_sizing
+    use_signal_quality = not args.no_signal_quality
 
     if args.walk_forward:
         run_walk_forward_analysis(
@@ -711,6 +953,17 @@ def main():
             take_profit=args.take_profit,
             trailing_stop=args.trailing_stop,
             max_drawdown_limit=args.max_drawdown_limit,
+            use_trend_filter=use_trend_filter,
+            use_volatility_filter=use_volatility_filter,
+            use_position_sizing=use_position_sizing,
+            use_signal_quality=use_signal_quality,
+            signal_quality_threshold=args.signal_quality_threshold,
+            max_holding_days=args.max_holding_days,
+            trend_short_window=args.trend_short_window,
+            trend_long_window=args.trend_long_window,
+            volatility_window=args.volatility_window,
+            volatility_percentile=args.volatility_percentile,
+            base_position_size=args.base_position_size,
         )
     else:
         run_backtest(
@@ -726,6 +979,17 @@ def main():
             take_profit=args.take_profit,
             trailing_stop=args.trailing_stop,
             max_drawdown_limit=args.max_drawdown_limit,
+            use_trend_filter=use_trend_filter,
+            use_volatility_filter=use_volatility_filter,
+            use_position_sizing=use_position_sizing,
+            use_signal_quality=use_signal_quality,
+            signal_quality_threshold=args.signal_quality_threshold,
+            max_holding_days=args.max_holding_days,
+            trend_short_window=args.trend_short_window,
+            trend_long_window=args.trend_long_window,
+            volatility_window=args.volatility_window,
+            volatility_percentile=args.volatility_percentile,
+            base_position_size=args.base_position_size,
         )
 
 
