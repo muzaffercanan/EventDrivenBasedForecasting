@@ -31,12 +31,6 @@ git clone https://github.com/kuantuna/SPDPvCNN.git
 
 - **_[Ozyegin University](https://www.ozyegin.edu.tr/)_**
 
-## **_Project Members_**
-
-- **_[Tuna Tuncer](https://github.com/kuantuna)_**<br/>
-- **_[Uygar Kaya](https://github.com/UygarKAYA)_**<br/>
-- **_[Onur Alaçam](https://github.com/Onralcm)_**<br/>
-- **_[Tuğcan Hoşer](https://github.com/Tugcannn)_**
 
 ## **_Project Supervisor_**
 
