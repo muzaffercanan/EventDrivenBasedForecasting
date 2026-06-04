@@ -6,6 +6,7 @@ SP500 Sentiment Backtest (standalone)
 - Applies next-day execution to avoid look-ahead (position_t uses signal_{t-1})
 - Computes daily PnL and reports metrics: Sharpe, Sortino, CAGR, Calmar, Max Drawdown, Hit Ratio, etc.
 - Supports walk-forward analysis for out-of-sample testing
+- Supports purged k-fold cross-validation with embargo to prevent data leakage
 
 Inputs (defaults):
   - Sentiment agg: SP500_news/processed/sp500_headlines_daily_agg.csv  (columns: date, signed_mean, news_count, ...)
@@ -25,12 +26,21 @@ Usage (walk-forward analysis):
       --agg_csv SP500_news/processed/sp500_headlines_daily_agg.csv \
       --price_csv SP500_news/raw/sp500_headlines_2008_2024.csv
 
+Usage (purged k-fold cross-validation):
+  python sp500_sentiment_backtest.py \
+      --purged_kfold \
+      --n_splits 5 --purge_days 5 --embargo_days 1 \
+      --agg_csv SP500_news/processed/sp500_headlines_daily_agg.csv \
+      --price_csv SP500_news/raw/sp500_headlines_2008_2024.csv
+
 Outputs:
   - SP500_news/results/backtest_metrics.json
   - SP500_news/results/backtest_equity_curve.csv
   - SP500_news/results/backtest_summary.txt
   - SP500_news/results/walk_forward_metrics.json (if walk-forward)
   - SP500_news/results/walk_forward_summary.txt (if walk-forward)
+  - SP500_news/results/purged_kfold_metrics.json (if purged_kfold)
+  - SP500_news/results/purged_kfold_summary.txt (if purged_kfold)
 
 Requires: pandas, numpy
 """
@@ -892,6 +902,328 @@ def run_walk_forward_analysis(agg_csv: str,
     return df_combined, walk_forward_metrics
 
 
+def run_purged_kfold_analysis(agg_csv: str,
+                               price_csv: str,
+                               date_col: str = "Date",
+                               price_col: str = "CP",
+                               tpos: float = 0.10,
+                               tneg: float = 0.10,
+                               nmin: int = 5,
+                               ret_type: str = "log",
+                               n_splits: int = 5,
+                               purge_days: int = 5,
+                               embargo_days: int = 1,
+                               stop_loss: float = None,
+                               take_profit: float = None,
+                               trailing_stop: float = None,
+                               max_drawdown_limit: float = None,
+                               use_trend_filter: bool = True,
+                               use_volatility_filter: bool = True,
+                               use_position_sizing: bool = True,
+                               use_signal_quality: bool = True,
+                               signal_quality_threshold: float = 0.15,
+                               max_holding_days: int = 20,
+                               trend_short_window: int = 50,
+                               trend_long_window: int = 200,
+                               volatility_window: int = 20,
+                               volatility_percentile: float = 75.0,
+                               base_position_size: float = 1.0) -> Tuple[pd.DataFrame, Dict]:
+    """
+    Purged K-Fold Cross-Validation with Embargo
+    
+    This method splits data into k folds while ensuring:
+    1. Purged: Training data before test period is removed to prevent look-ahead bias
+    2. Embargo: Data after test period is removed to prevent information leakage
+    
+    Parameters:
+    - n_splits: Number of folds (default: 5)
+    - purge_days: Days to purge before test period (default: 5)
+    - embargo_days: Days to embargo after test period (default: 1)
+    """
+    _ensure_dirs()
+    
+    print("=" * 60)
+    print("PURGED K-FOLD CROSS-VALIDATION WITH EMBARGO")
+    print("=" * 60)
+    print(f"Number of folds: {n_splits}")
+    print(f"Purge days (before test): {purge_days}")
+    print(f"Embargo days (after test): {embargo_days}")
+    print()
+    
+    # Load data
+    if not os.path.exists(agg_csv):
+        raise FileNotFoundError(f"Aggregation file not found: {agg_csv}")
+    if not os.path.exists(price_csv):
+        raise FileNotFoundError(f"Price file not found: {price_csv}")
+    
+    df_sig = pd.read_csv(agg_csv)
+    df_price = pd.read_csv(price_csv)
+    
+    # Compute returns
+    df_ret = compute_returns(df_price, date_col=date_col, price_col=price_col, ret_type=ret_type)
+    
+    # Merge signal and returns
+    df = merge_signal_returns(df_sig, df_ret, date_col_sig="date", date_col_ret=date_col)
+    
+    # Sort by date
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    df = df.sort_values(date_col).reset_index(drop=True)
+    df = df.dropna(subset=[date_col]).copy()
+    
+    if len(df) == 0:
+        raise ValueError("No valid data after merging!")
+    
+    min_date = df[date_col].min()
+    max_date = df[date_col].max()
+    
+    print(f"Data range: {min_date.date()} to {max_date.date()}")
+    print(f"Total days: {len(df)}")
+    print()
+    
+    # Create k folds with purged and embargo periods
+    total_days = len(df)
+    fold_size = total_days // n_splits
+    
+    fold_results = []
+    all_test_results = []
+    
+    for fold_idx in range(n_splits):
+        # Calculate fold boundaries
+        test_start_idx = fold_idx * fold_size
+        test_end_idx = (fold_idx + 1) * fold_size if fold_idx < n_splits - 1 else total_days
+        
+        # Purge: Remove purge_days before test period
+        train_end_idx = max(0, test_start_idx - purge_days)
+        
+        # Embargo: Remove embargo_days after test period
+        train_start_idx_next = min(total_days, test_end_idx + embargo_days)
+        
+        # Training set: All data before purge period
+        train_indices = list(range(0, train_end_idx))
+        
+        # Test set: Fold period
+        test_indices = list(range(test_start_idx, test_end_idx))
+        
+        if len(train_indices) == 0 or len(test_indices) == 0:
+            print(f"Fold {fold_idx + 1}/{n_splits}: Skipping (insufficient data)")
+            continue
+        
+        train_start_date = df.iloc[0][date_col]
+        train_end_date = df.iloc[train_end_idx - 1][date_col] if train_end_idx > 0 else df.iloc[0][date_col]
+        test_start_date = df.iloc[test_start_idx][date_col]
+        test_end_date = df.iloc[test_end_idx - 1][date_col]
+        
+        print(f"Fold {fold_idx + 1}/{n_splits}:")
+        print(f"  Train: [{train_start_date.date()} to {train_end_date.date()}] ({len(train_indices)} days)")
+        print(f"  Purge: {purge_days} days before test")
+        print(f"  Test:  [{test_start_date.date()} to {test_end_date.date()}] ({len(test_indices)} days)")
+        print(f"  Embargo: {embargo_days} days after test")
+        
+        # Get train and test dataframes
+        df_train = df.iloc[train_indices].copy().reset_index(drop=True)
+        df_test = df.iloc[test_indices].copy().reset_index(drop=True)
+        
+        if len(df_test) == 0:
+            print(f"  [SKIP] No data in test period")
+            continue
+        
+        # Reconstruct price if needed
+        if price_col not in df_test.columns:
+            df_test["_cumret"] = (1.0 + df_test["ret"].fillna(0.0)).cumprod()
+            df_test[price_col] = df_test["_cumret"] * 100
+        
+        # Apply filters
+        if use_trend_filter:
+            df_test["trend"] = compute_trend_filter(df_test, price_col=price_col,
+                                                     short_window=trend_short_window,
+                                                     long_window=trend_long_window)
+        
+        if use_volatility_filter:
+            df_test["vol_filter"] = compute_volatility_filter(df_test, ret_col="ret",
+                                                               window=volatility_window,
+                                                               threshold_percentile=volatility_percentile)
+        
+        # Build positions
+        df_test["position_raw"] = build_positions_enhanced(
+            df_test, tpos=tpos, tneg=tneg, nmin=nmin,
+            use_trend_filter=use_trend_filter,
+            use_volatility_filter=use_volatility_filter,
+            use_signal_quality=use_signal_quality,
+            signal_quality_threshold=signal_quality_threshold
+        )
+        
+        # Apply holding period limit
+        df_test["position_raw"] = apply_holding_period_limit(df_test, position_col="position_raw",
+                                                               max_holding_days=max_holding_days)
+        
+        # Shift positions for next-day execution
+        df_test["position"] = shift_positions(df_test, pos_col="position_raw")
+        
+        # Position sizing
+        if use_position_sizing:
+            df_test["position_size"] = compute_position_size(df_test, ret_col="ret",
+                                                               base_size=base_position_size,
+                                                               volatility_window=volatility_window)
+            df_test["position"] = df_test["position"] * df_test["position_size"]
+        
+        # Risk management
+        if any([stop_loss, take_profit, trailing_stop, max_drawdown_limit]):
+            if price_col not in df_test.columns:
+                if "_cumret" not in df_test.columns:
+                    df_test["_cumret"] = (1.0 + df_test["ret"].fillna(0.0)).cumprod()
+                df_test[price_col] = df_test["_cumret"] * 100
+            
+            df_test = apply_risk_management(
+                df_test,
+                position_col="position",
+                ret_col="ret",
+                price_col=price_col,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                trailing_stop=trailing_stop,
+                max_drawdown_limit=max_drawdown_limit
+            )
+            df_test["position"] = df_test["position_with_risk"]
+        else:
+            df_test["risk_action"] = ""
+            df_test["unrealized_pnl"] = 0.0
+        
+        # Compute PnL
+        df_test["pnl"] = df_test["position"] * df_test["ret"]
+        df_test["equity"] = (1.0 + df_test["pnl"].fillna(0.0)).cumprod()
+        
+        # Calculate metrics
+        df_test_clean = df_test.dropna(subset=["ret"]).copy()
+        if len(df_test_clean) == 0:
+            print(f"  [SKIP] No valid returns")
+            continue
+        
+        m = metrics_from_pnl(df_test_clean["pnl"].fillna(0.0))
+        
+        # Add fold info
+        m["fold"] = fold_idx + 1
+        m["train_start"] = train_start_date.strftime("%Y-%m-%d")
+        m["train_end"] = train_end_date.strftime("%Y-%m-%d")
+        m["test_start"] = test_start_date.strftime("%Y-%m-%d")
+        m["test_end"] = test_end_date.strftime("%Y-%m-%d")
+        m["test_days"] = len(df_test_clean)
+        
+        fold_results.append(m)
+        all_test_results.append(df_test_clean)
+        
+        print(f"  Sharpe: {m['sharpe']:.3f}, CAGR: {m['cagr']:.3f}, Hit Ratio: {m['hit_ratio']:.3f}")
+        print()
+    
+    if not fold_results:
+        raise ValueError("No valid folds found!")
+    
+    # Combine all test results
+    df_combined = pd.concat(all_test_results, ignore_index=True)
+    
+    # Calculate overall metrics
+    overall_metrics = metrics_from_pnl(df_combined["pnl"].fillna(0.0))
+    
+    # Period statistics
+    period_df = pd.DataFrame(fold_results)
+    period_statistics = {
+        "num_folds": len(fold_results),
+        "avg_sharpe": period_df["sharpe"].mean(),
+        "std_sharpe": period_df["sharpe"].std(),
+        "avg_sortino": period_df["sortino"].mean(),
+        "avg_cagr": period_df["cagr"].mean(),
+        "avg_hit_ratio": period_df["hit_ratio"].mean(),
+        "avg_max_drawdown": period_df["max_drawdown"].mean(),
+        "positive_folds": (period_df["cagr"] > 0).sum(),
+        "negative_folds": (period_df["cagr"] <= 0).sum()
+    }
+    
+    # Convert numpy types to native Python types for JSON serialization
+    def convert_to_native(obj):
+        if isinstance(obj, dict):
+            return {k: convert_to_native(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert_to_native(item) for item in obj]
+        elif isinstance(obj, (np.integer, np.int64, np.int32)):
+            return int(obj)
+        elif isinstance(obj, (np.floating, np.float64, np.float32)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        else:
+            return obj
+    
+    # Prepare output metrics
+    purged_kfold_metrics = {
+        "overall_metrics": convert_to_native(overall_metrics),
+        "fold_statistics": convert_to_native(period_statistics),
+        "fold_details": convert_to_native(fold_results)
+    }
+    
+    # Save outputs
+    out_eq = "SP500_news/results/purged_kfold_equity_curve.csv"
+    df_combined[[date_col, "ret", "position", "pnl", "equity", "signed_mean", "news_count"]].to_csv(out_eq, index=False)
+    
+    out_metrics = "SP500_news/results/purged_kfold_metrics.json"
+    with open(out_metrics, "w", encoding="utf-8") as f:
+        json.dump(purged_kfold_metrics, f, indent=2)
+    
+    out_folds = "SP500_news/results/purged_kfold_folds.csv"
+    period_df.to_csv(out_folds, index=False)
+    
+    # Summary
+    out_summary = "SP500_news/results/purged_kfold_summary.txt"
+    with open(out_summary, "w", encoding="utf-8") as f:
+        f.write("SP500 Purged K-Fold Cross-Validation Summary\n")
+        f.write("=" * 60 + "\n\n")
+        f.write(f"Number of folds: {n_splits}\n")
+        f.write(f"Purge days (before test): {purge_days}\n")
+        f.write(f"Embargo days (after test): {embargo_days}\n\n")
+        
+        f.write("Overall Metrics (Combined Test Folds):\n")
+        f.write("-" * 60 + "\n")
+        for k, v in overall_metrics.items():
+            f.write(f"{k}: {v}\n")
+        
+        f.write("\nFold Statistics:\n")
+        f.write("-" * 60 + "\n")
+        for k, v in period_statistics.items():
+            f.write(f"{k}: {v}\n")
+        
+        f.write("\nFold Details:\n")
+        f.write("-" * 60 + "\n")
+        for i, p in enumerate(fold_results):
+            f.write(f"\nFold {i+1} [{p['test_start']} to {p['test_end']}]:\n")
+            f.write(f"  Sharpe: {p['sharpe']:.3f}\n")
+            f.write(f"  Sortino: {p['sortino']:.3f}\n")
+            f.write(f"  CAGR: {p['cagr']:.3f}\n")
+            f.write(f"  Max DD: {p['max_drawdown']:.3f}\n")
+            f.write(f"  Hit Ratio: {p['hit_ratio']:.3f}\n")
+    
+    print("=" * 60)
+    print("PURGED K-FOLD RESULTS")
+    print("=" * 60)
+    print(f"\nOverall Metrics (All Test Folds Combined):")
+    print(f"  Sharpe: {overall_metrics['sharpe']:.3f}")
+    print(f"  Sortino: {overall_metrics['sortino']:.3f}")
+    print(f"  CAGR: {overall_metrics['cagr']:.3f}")
+    print(f"  Max Drawdown: {overall_metrics['max_drawdown']:.3f}")
+    print(f"  Hit Ratio: {overall_metrics['hit_ratio']:.3f}")
+    print(f"\nFold Statistics ({len(fold_results)} folds):")
+    print(f"  Avg Sharpe: {period_statistics['avg_sharpe']:.3f} (std: {period_statistics['std_sharpe']:.3f})")
+    print(f"  Avg Sortino: {period_statistics['avg_sortino']:.3f}")
+    print(f"  Avg CAGR: {period_statistics['avg_cagr']:.3f}")
+    print(f"  Positive folds: {period_statistics['positive_folds']}/{len(fold_results)}")
+    print(f"  Negative folds: {period_statistics['negative_folds']}/{len(fold_results)}")
+    
+    print(f"\nSaved:")
+    print(f" - {out_eq}")
+    print(f" - {out_metrics}")
+    print(f" - {out_folds}")
+    print(f" - {out_summary}")
+    
+    return df_combined, purged_kfold_metrics
+
+
 def main():
     p = argparse.ArgumentParser(description="Backtest sentiment-based SP500 strategy (standalone)")
     p.add_argument("--agg_csv", type=str, default="SP500_news/processed/sp500_headlines_daily_agg.csv")
@@ -915,6 +1247,12 @@ def main():
     p.add_argument("--test_years", type=int, default=1, help="Test period in years (for walk-forward)")
     p.add_argument("--step_months", type=int, default=6, help="Step size in months (for walk-forward)")
     
+    # Purged K-Fold arguments
+    p.add_argument("--purged_kfold", action="store_true", help="Enable purged k-fold cross-validation with embargo")
+    p.add_argument("--n_splits", type=int, default=5, help="Number of folds (default: 5)")
+    p.add_argument("--purge_days", type=int, default=5, help="Days to purge before test period (default: 5)")
+    p.add_argument("--embargo_days", type=int, default=1, help="Days to embargo after test period (default: 1)")
+    
     # Enhanced filter arguments
     p.add_argument("--no_trend_filter", action="store_true", help="Disable trend filter")
     p.add_argument("--no_volatility_filter", action="store_true", help="Disable volatility filter")
@@ -936,7 +1274,36 @@ def main():
     use_position_sizing = not args.no_position_sizing
     use_signal_quality = not args.no_signal_quality
 
-    if args.walk_forward:
+    if args.purged_kfold:
+        run_purged_kfold_analysis(
+            agg_csv=args.agg_csv,
+            price_csv=args.price_csv,
+            date_col=args.date_col,
+            price_col=args.price_col,
+            tpos=args.tpos,
+            tneg=args.tneg,
+            nmin=args.nmin,
+            ret_type=args.ret,
+            n_splits=args.n_splits,
+            purge_days=args.purge_days,
+            embargo_days=args.embargo_days,
+            stop_loss=args.stop_loss,
+            take_profit=args.take_profit,
+            trailing_stop=args.trailing_stop,
+            max_drawdown_limit=args.max_drawdown_limit,
+            use_trend_filter=use_trend_filter,
+            use_volatility_filter=use_volatility_filter,
+            use_position_sizing=use_position_sizing,
+            use_signal_quality=use_signal_quality,
+            signal_quality_threshold=args.signal_quality_threshold,
+            max_holding_days=args.max_holding_days,
+            trend_short_window=args.trend_short_window,
+            trend_long_window=args.trend_long_window,
+            volatility_window=args.volatility_window,
+            volatility_percentile=args.volatility_percentile,
+            base_position_size=args.base_position_size,
+        )
+    elif args.walk_forward:
         run_walk_forward_analysis(
             agg_csv=args.agg_csv,
             price_csv=args.price_csv,
